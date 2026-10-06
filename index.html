@@ -722,10 +722,10 @@ function refreshActive(){
 /* ── notifications ── */
 function pendingForMe(){return requests.filter(r=>r.status==='pending'&&r.managerId===currentUser.id);}
 function ticketsReady(){
-  if(currentUser.role==='admin')return requests.filter(r=>r.status==='approved');
-  return requests.filter(r=>r.status==='approved'&&r.managerId===currentUser.id);
+  if(currentUser.role==='admin')return requests.filter(needsTicket);
+  return requests.filter(r=>needsTicket(r)&&r.managerId===currentUser.id);
 }
-function myAwaitingOutcome(){return requests.filter(r=>r.requesterId===currentUser.id&&r.status==='approved');}
+function myAwaitingOutcome(){return requests.filter(r=>{if(r.requesterId!==currentUser.id||r.status!=='approved')return false;const s=effStage(r);return !s||s==='go';});}
 function updateBell(){
   let n=0,notes=[];
   if(currentUser.role==='manager'||currentUser.role==='admin'){const p=pendingForMe().length;n+=p;}
@@ -759,6 +759,7 @@ function companyOptionsForUser(){
   return companies.slice();
 }
 function initNewForm(){
+  resubmitCtx=null;
   const sel=$('nrCompany');const opts=companyOptionsForUser();
   sel.innerHTML=opts.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
   if(currentUser.role==='employee'&&currentUser.company){sel.value=currentUser.company;sel.disabled=true;}else sel.disabled=false;
@@ -809,6 +810,7 @@ window.submitRequest=async function(){
     boardMember:'',status:'logged',managerId:'',managerName:'',
     decidedAt:0,decisionNote:'',outcomeAt:0,outcomeReason:'',
     autoApproved:false,autoNote:'',awayManagerId:'',onBehalfId:'',onBehalfName:'',employeeAway:false};
+  if(resubmitCtx){r.resubmitOf=resubmitCtx.of;r.resubmitNote=resubmitCtx.note||'';r.resubmitMode=resubmitCtx.mode;resubmitCtx=null;}
   const ob=$('nrOnBehalf');
   if(ob&&ob.value){const emp=userById(ob.value);if(emp){r.onBehalfId=emp.id;r.onBehalfName=emp.name;r.employeeAway=!!emp.away;}}
   if(p.ownerNafath){
@@ -888,6 +890,7 @@ function reqMeta(r,opts){opts=opts||{};
   if((r.status==='completed'||r.status==='failed')&&r.outcomeAt)meta+=`<br><b>تاريخ النتيجة:</b> <span class="mono">${fmtG(r.outcomeAt)}</span>`;
   if(r.autoApproved)meta+=`<br><b>ملاحظة:</b> اعتُمد آلياً أثناء غياب المدير ${esc(r.managerName||'')}`;
   if(r.employeeAway)meta+=`<br><b>ملاحظة:</b> الموظف غائب — أُنشئ بمعرفة المدير${r.onBehalfName?' (عن '+esc(r.onBehalfName)+')':''}`;
+  meta+=resubmitHtml(r);
   meta+=boardRespHtml(r);
   meta+='</div>';
   return meta;
@@ -899,10 +902,88 @@ function reqCard(r,opts){opts=opts||{};
   let acts='';(opts.actions||[]).forEach(a=>acts+=a);
   const _bq=boardResp[r.id];
   if(_bq&&_bq.decision==='info_requested'&&canReplyBoard(r)){const _th=_bq.thread||[];const _last=_th[_th.length-1];if(!_last||_last.by==='board')acts+=`<button class="btn bp bsm" onclick="replyBoard('${r.id}')">الرد على استفسار المجلس</button>`;}
-  return `<div class="req s-${r.status}">
+  return `<div class="req s-${cardCls(r)}">
     <div class="req-top"><div><div class="req-plat">${esc(r.platform)}</div><div class="req-comp">${esc(r.company)} · <span class="mono">${esc(r.ref)}</span></div></div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap">${owner}${badge}${boardBadge(r)}</div></div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">${owner}${stageBadge(r,badge)}${boardBadge(r)}</div></div>
     ${meta}${acts?`<div class="req-acts">${acts}</div>`:''}</div>`;
+}
+
+/* ── board stage machine ── */
+let resubmitCtx=null,stageTimer=null,reconciling=false;
+const STAGE={
+  await:{t:'معتمد — بانتظار قرار المجلس',c:'bd-pending',k:'pending'},
+  info:{t:'المجلس طلب تفاصيل — بانتظار ردّك',c:'bd-owner',k:'pending'},
+  go:{t:'وافق المجلس — جاهز للتنفيذ',c:'bd-completed',k:'approved'},
+  denied:{t:'رُفض من المجلس',c:'bd-rejected',k:'rejected'},
+  deferred:{t:'مؤجَّل من المجلس',c:'bd-pending',k:'pending'},
+  due:{t:'عاد للمجلس — بانتظار القرار',c:'bd-pending',k:'pending'}
+};
+function effStage(r){
+  if(!r.ownerNafath||!r.boardMember)return null;
+  if(r.rejectedBy==='board')return 'denied';
+  if(r.status!=='approved')return null;
+  const b=boardResp[r.id];
+  if(!b)return 'await';
+  const d=b.decision;
+  if(d==='approved')return 'go';
+  if(d==='rejected')return 'denied';
+  if(d==='postponed')return (b.postponeUntil&&b.postponeUntil>Date.now())?'deferred':'due';
+  if(d==='info_requested'){const th=b.thread||[],last=th[th.length-1];return(last&&last.by==='staff')?'await':'info';}
+  return 'await';
+}
+function stageBadge(r,badge){const s=effStage(r);return s?`<span class="badge ${STAGE[s].c}">${STAGE[s].t}</span>`:badge;}
+function cardCls(r){const s=effStage(r);return s?STAGE[s].k:r.status;}
+function needsTicket(r){const s=effStage(r);return r.status==='approved'&&(!s||['await','info','deferred','due'].includes(s));}
+function scheduleStageRefresh(){
+  clearTimeout(stageTimer);
+  const now=Date.now();
+  const next=Object.values(boardResp).filter(b=>b&&b.decision==='postponed'&&b.postponeUntil>now).map(b=>b.postponeUntil).sort((a,b)=>a-b)[0];
+  if(!next)return;
+  stageTimer=setTimeout(()=>{refreshActive();updateBell();scheduleStageRefresh();},Math.min(next-now+500,2000000000));
+}
+async function reconcileRejected(id,d){
+  const r=requests.find(x=>x.id===id);
+  if(!r||r.status!=='approved'||!canReplyBoard(r)||reconciling)return;
+  reconciling=true;
+  try{r.status='rejected';r.rejectedBy='board';r.boardNote=d.note||'';r.boardDecidedAt=d.decidedAt||Date.now();await saveReqs();updateBell();}
+  catch(e){r.status='approved';delete r.rejectedBy;}
+  finally{reconciling=false;}
+}
+function mineActions(r){
+  const a=[],s=effStage(r),id=r.id;
+  if(r.status==='approved'&&(!s||s==='go'))a.push(`<button class="btn bg- bsm" onclick="openOutcome('${id}')">تسجيل نتيجة الدخول</button>`);
+  if(s==='go')a.push(`<button class="btn bs bsm" onclick="resubmit('${id}','more')">＋ طلب جديد لمهام إضافية</button>`);
+  if(s==='denied')a.push(`<button class="btn bp bsm" onclick="resubmit('${id}','denied')">إعادة تقديم الطلب</button>`);
+  if(s==='deferred')a.push(`<button class="btn bp bsm" onclick="reopenDeferred('${id}')">إعادة عرض على المجلس الآن</button>`);
+  if(s==='await'||s==='due'||s==='deferred')a.push(`<button class="btn bs bsm" onclick="viewTicketById('${id}')">📲 التذكرة</button>`);
+  if(['logged','pending'].includes(r.status)||(r.status==='approved'&&(!s||['await','info','deferred','due'].includes(s))))a.push(`<button class="btn bs bsm" onclick="addTaskToReq('${id}')">＋ إضافة مهمة</button>`);
+  return a;
+}
+window.resubmit=function(id,mode){
+  const r=requests.find(x=>x.id===id);if(!r)return;
+  let note='';
+  if(mode==='denied'){note=(prompt('اكتب مبرر إعادة التقديم ليطّلع عليه عضو المجلس:')||'').trim();if(!note){toast('المبرر مطلوب لإعادة التقديم','er');return;}}
+  go('new');
+  const sel=$('nrCompany');if(!sel.disabled)sel.value=r.company;
+  fillPlatforms();$('nrPlatform').value=r.platformId;onPlatformPick();
+  if($('nrBoard')&&r.boardMember)$('nrBoard').value=r.boardMember;
+  $('nrEntity').value=r.entity||'';if($('nrDuration'))$('nrDuration').value=r.duration||'نفس اليوم';
+  nrTasks=mode==='more'?[]:(r.tasks||[]).map(t=>t.text);renderTaskList();
+  resubmitCtx={of:r.ref,mode:mode,note:note};
+  toast(mode==='more'?'أضف المهام الإضافية ثم ارفع الطلب':'راجع بيانات الطلب ثم ارفعه','ok');
+};
+window.reopenDeferred=async function(id){
+  const b=boardResp[id];if(!b||b.decision!=='postponed')return;
+  if(!confirm('إعادة عرض الطلب على عضو المجلس الآن قبل موعد التأجيل ('+fmtG(b.postponeUntil)+')؟'))return;
+  if(!db||!updateDoc){toast('تعذّر الإرسال: لا يوجد اتصال بقاعدة البيانات','er');return;}
+  try{
+    await updateDoc(doc(db,COL,'acc_resp_'+id),{'data.postponeUntil':Date.now(),'data.thread':arrayUnion({by:'staff',name:currentUser.name,text:'أُعيد عرض الطلب بعد التأجيل',at:Date.now()}),updatedAt:serverTimestamp()});
+    toast('أُعيد عرض الطلب على عضو المجلس','ok');
+  }catch(e){toast('تعذّر الإرسال — تحقق من الاتصال','er');}
+};
+function resubmitHtml(r){
+  if(!r.resubmitOf)return '';
+  return `<br><b>${r.resubmitMode==='more'?'مهام إضافية للطلب':'إعادة تقديم للطلب'}:</b> <span class="mono">${esc(r.resubmitOf)}</span>`+(r.resubmitNote?`<br><b>مبرر إعادة التقديم:</b> ${esc(r.resubmitNote)}`:'');
 }
 
 /* ── board decisions (written by the mobile app to acc_resp_<id>) ── */
@@ -918,7 +999,7 @@ function relevantForViewer(r){
 function canReplyBoard(r){return !!currentUser&&(currentUser.id===r.requesterId||currentUser.id===r.managerId||currentUser.role==='admin');}
 function syncRespListeners(){
   if(!db||!onSnapshot||!currentUser)return;
-  const want=new Set(requests.filter(r=>r.ownerNafath&&r.boardMember&&['approved','completed','failed'].includes(r.status)&&relevantForViewer(r)).map(r=>r.id));
+  const want=new Set(requests.filter(r=>r.ownerNafath&&r.boardMember&&(['approved','completed','failed'].includes(r.status)||r.rejectedBy==='board')&&relevantForViewer(r)).map(r=>r.id));
   want.forEach(id=>{
     if(respUnsubs[id])return;
     try{
@@ -935,7 +1016,8 @@ function syncRespListeners(){
             }
           }
         }else delete boardResp[id];
-        refreshActive();updateBell();
+        if(s.exists()&&boardResp[id]&&boardResp[id].decision==='rejected')reconcileRejected(id,boardResp[id]);
+        scheduleStageRefresh();refreshActive();updateBell();
       },()=>{});
     }catch(e){}
   });
@@ -948,7 +1030,7 @@ function notifyDecision(id,d){
   toast('قرار المجلس على «'+r.platform+'»: '+(BR_LABEL[d.decision]||d.decision)+(d.decision==='info_requested'&&last&&last.by==='board'?' — '+last.text:''),t);
 }
 function boardBadge(r){
-  if(!r.ownerNafath||!r.boardMember)return '';
+  if(!r.ownerNafath||!r.boardMember||effStage(r))return '';
   const b=boardResp[r.id];
   if(b)return `<span class="badge ${BR_CLS[b.decision]||'bd-owner'}">${esc(BR_LABEL[b.decision]||b.decision)}</span>`;
   if(r.status==='approved')return '<span class="badge bd-pending">بانتظار قرار المجلس</span>';
@@ -999,9 +1081,7 @@ function renderMine(){
   const el=$('mineList');
   if(!list.length){el.innerHTML='<div class="empty"><div class="ico">📋</div>لا توجد طلبات بعد. ابدأ بطلب دخول جديد.</div>';return;}
   el.innerHTML=list.map(r=>{
-    let acts=[];
-    if(r.status==='approved')acts.push(`<button class="btn bg- bsm" onclick="openOutcome('${r.id}')">تسجيل نتيجة الدخول</button>`);
-    if(['logged','pending','approved'].includes(r.status))acts.push(`<button class="btn bs bsm" onclick="addTaskToReq('${r.id}')">＋ إضافة مهمة</button>`);
+    const acts=mineActions(r);
     return reqCard(r,{actions:acts});
   }).join('');
 }
@@ -1251,6 +1331,7 @@ window.saveOutcome=async function(){
 };
 window.addTaskToReq=async function(id){
   const r=requests.find(x=>x.id===id);if(!r)return;
+  { const _s=effStage(r); if(_s==='go'||_s==='denied'){toast('لا تُضاف مهام بعد قرار المجلس — قدّم طلباً جديداً','wn');return;} }
   const v=prompt('أدخل المهمة الجديدة المطلوب إنجازها خلال هذا الدخول:');if(!v||!v.trim())return;
   r.tasks=r.tasks||[];r.tasks.push({text:v.trim(),ts:Date.now(),by:currentUser.name});
   await saveReqs();toast('أُضيفت المهمة','ok');refreshActive();
