@@ -590,11 +590,11 @@ input[type=checkbox]{accent-color:var(--navy);width:17px;height:17px}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
 <script type="module">
-let initializeApp,getFirestore,doc,setDoc,getDoc,onSnapshot,serverTimestamp,db=null,FB_OK=false;
+let initializeApp,getFirestore,doc,setDoc,getDoc,onSnapshot,serverTimestamp,updateDoc,arrayUnion,db=null,FB_OK=false;
 try{
   const _a=await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js');
   const _f=await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js');
-  ({initializeApp}=_a);({getFirestore,doc,setDoc,getDoc,onSnapshot,serverTimestamp}=_f);
+  ({initializeApp}=_a);({getFirestore,doc,setDoc,getDoc,onSnapshot,serverTimestamp,updateDoc,arrayUnion}=_f);
   db=getFirestore(initializeApp({apiKey:"AIzaSyCKTuFXEXhG9h3HBiev4B9tSpAv5RHrBdY",authDomain:"rh-task-f5af5.firebaseapp.com",projectId:"rh-task-f5af5",storageBucket:"rh-task-f5af5.firebasestorage.app",messagingSenderId:"659904540726",appId:"1:659904540726:web:906b95022cc9607aa3a897"}));FB_OK=true;
 }catch(e){console.warn('Firebase unavailable — local mode',e);}
 const COL='rh_system';
@@ -675,9 +675,10 @@ function enterApp(){
   buildNav();
   updateAwayUI();
   // realtime
-  fbListen('acc_requests',d=>{if(Array.isArray(d)){requests=d;refreshActive();updateBell();}});
+  fbListen('acc_requests',d=>{if(Array.isArray(d)){requests=d;syncRespListeners();refreshActive();updateBell();}});
   fbListen('acc_users',d=>{if(Array.isArray(d))users=d;});
   fbListen('acc_platforms',d=>{if(Array.isArray(d))platforms=d;});
+  syncRespListeners();
   // default page
   const first=currentUser.role==='employee'?'new':currentUser.role==='manager'?'appr':currentUser.role==='board'?'board':'dash';
   go(first);
@@ -887,6 +888,7 @@ function reqMeta(r,opts){opts=opts||{};
   if((r.status==='completed'||r.status==='failed')&&r.outcomeAt)meta+=`<br><b>تاريخ النتيجة:</b> <span class="mono">${fmtG(r.outcomeAt)}</span>`;
   if(r.autoApproved)meta+=`<br><b>ملاحظة:</b> اعتُمد آلياً أثناء غياب المدير ${esc(r.managerName||'')}`;
   if(r.employeeAway)meta+=`<br><b>ملاحظة:</b> الموظف غائب — أُنشئ بمعرفة المدير${r.onBehalfName?' (عن '+esc(r.onBehalfName)+')':''}`;
+  meta+=boardRespHtml(r);
   meta+='</div>';
   return meta;
 }
@@ -895,11 +897,80 @@ function reqCard(r,opts){opts=opts||{};
   const owner=r.ownerNafath?`<span class="badge bd-owner">🔐 نفاذ المالك</span>`:'';
   const meta=reqMeta(r,opts);
   let acts='';(opts.actions||[]).forEach(a=>acts+=a);
+  const _bq=boardResp[r.id];
+  if(_bq&&_bq.decision==='info_requested'&&canReplyBoard(r)){const _th=_bq.thread||[];const _last=_th[_th.length-1];if(!_last||_last.by==='board')acts+=`<button class="btn bp bsm" onclick="replyBoard('${r.id}')">الرد على استفسار المجلس</button>`;}
   return `<div class="req s-${r.status}">
     <div class="req-top"><div><div class="req-plat">${esc(r.platform)}</div><div class="req-comp">${esc(r.company)} · <span class="mono">${esc(r.ref)}</span></div></div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap">${owner}${badge}</div></div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">${owner}${badge}${boardBadge(r)}</div></div>
     ${meta}${acts?`<div class="req-acts">${acts}</div>`:''}</div>`;
 }
+
+/* ── board decisions (written by the mobile app to acc_resp_<id>) ── */
+let boardResp={};const respUnsubs={},respSeen={};
+const BR_LABEL={approved:'وافق المجلس',rejected:'رفض المجلس',postponed:'أجّل المجلس',info_requested:'طلب المجلس تفاصيل'};
+const BR_CLS={approved:'bd-completed',rejected:'bd-rejected',postponed:'bd-pending',info_requested:'bd-owner'};
+function relevantForViewer(r){
+  if(!currentUser)return false;
+  if(currentUser.role==='admin'||currentUser.role==='board')return true;
+  if(currentUser.role==='manager')return r.managerId===currentUser.id||r.requesterId===currentUser.id;
+  return r.requesterId===currentUser.id;
+}
+function canReplyBoard(r){return !!currentUser&&(currentUser.id===r.requesterId||currentUser.id===r.managerId||currentUser.role==='admin');}
+function syncRespListeners(){
+  if(!db||!onSnapshot||!currentUser)return;
+  const want=new Set(requests.filter(r=>r.ownerNafath&&r.boardMember&&['approved','completed','failed'].includes(r.status)&&relevantForViewer(r)).map(r=>r.id));
+  want.forEach(id=>{
+    if(respUnsubs[id])return;
+    try{
+      respUnsubs[id]=onSnapshot(doc(db,COL,'acc_resp_'+id),s=>{
+        const first=!(id in respSeen);respSeen[id]=true;
+        const prev=boardResp[id];
+        if(s.exists()){
+          const d=s.data().data||null;
+          if(d){
+            boardResp[id]=d;
+            if(!first){
+              const th=d.thread||[],pth=(prev&&prev.thread)||[],last=th[th.length-1];
+              if(!prev||prev.decision!==d.decision||(th.length>pth.length&&last&&last.by==='board'))notifyDecision(id,d);
+            }
+          }
+        }else delete boardResp[id];
+        refreshActive();updateBell();
+      },()=>{});
+    }catch(e){}
+  });
+  Object.keys(respUnsubs).forEach(id=>{if(!want.has(id)){try{respUnsubs[id]();}catch(e){}delete respUnsubs[id];delete boardResp[id];delete respSeen[id];}});
+}
+function notifyDecision(id,d){
+  const r=requests.find(x=>x.id===id);if(!r||!canReplyBoard(r))return;
+  const t={approved:'ok',rejected:'er',postponed:'wn',info_requested:'wn'}[d.decision]||'ok';
+  const th=d.thread||[],last=th[th.length-1];
+  toast('قرار المجلس على «'+r.platform+'»: '+(BR_LABEL[d.decision]||d.decision)+(d.decision==='info_requested'&&last&&last.by==='board'?' — '+last.text:''),t);
+}
+function boardBadge(r){
+  if(!r.ownerNafath||!r.boardMember)return '';
+  const b=boardResp[r.id];
+  if(b)return `<span class="badge ${BR_CLS[b.decision]||'bd-owner'}">${esc(BR_LABEL[b.decision]||b.decision)}</span>`;
+  if(r.status==='approved')return '<span class="badge bd-pending">بانتظار قرار المجلس</span>';
+  return '';
+}
+function boardRespHtml(r){
+  const b=boardResp[r.id];if(!b)return '';
+  let x=`<br><b>قرار المجلس:</b> <span class="badge ${BR_CLS[b.decision]||'bd-owner'}">${esc(BR_LABEL[b.decision]||b.decision)}</span>`+(b.memberName?' — '+esc(b.memberName):'')+(b.decidedAt?` <span class="mono" style="color:var(--muted)">${fmtG(b.decidedAt)}</span>`:'');
+  if(b.decision==='postponed'&&b.postponeUntil)x+=`<br><b>موعد النظر:</b> <span class="mono">${fmtG(b.postponeUntil)}</span>`;
+  if(b.note)x+=`<br><b>ملاحظة العضو:</b> ${esc(b.note)}`;
+  const th=b.thread||[];
+  if(th.length)x+='<br><b>المراسلة:</b>'+th.map(m=>`<div class="tm"><b>${m.by==='board'?'المجلس':esc(m.name||'الفريق')}:</b> <span>${esc(m.text)}</span></div>`).join('');
+  return x;
+}
+window.replyBoard=async function(id){
+  const text=(prompt('ردّك على استفسار المجلس:')||'').trim();if(!text)return;
+  if(!db||!updateDoc){toast('تعذّر الإرسال: لا يوجد اتصال بقاعدة البيانات','er');return;}
+  try{
+    await updateDoc(doc(db,COL,'acc_resp_'+id),{'data.thread':arrayUnion({by:'staff',name:currentUser.name,text,at:Date.now()}),updatedAt:serverTimestamp()});
+    toast('أُرسل ردّك إلى عضو المجلس','ok');
+  }catch(e){toast('تعذّر إرسال الرد — تحقق من الاتصال','er');}
+};
 
 /* ── board log rows (collapsible) ── */
 function opRow(r){
@@ -1173,6 +1244,7 @@ window.openOutcome=function(id){
 window.saveOutcome=async function(){
   const r=requests.find(x=>x.id===activeOutcomeId);if(!r)return;
   const res=$('outResult').value;
+  if(res==='completed'&&r.ownerNafath&&r.boardMember){const _b=boardResp[r.id];if(!_b||_b.decision!=='approved'){if(!confirm('لم تصدر موافقة عضو المجلس بعد ('+(_b?(BR_LABEL[_b.decision]||_b.decision):'بانتظار القرار')+'). تسجيل «تم الدخول» الآن؟'))return;}}
   if(res==='failed'){const reason=$('outReason').value.trim();if(!reason){toast('اذكر سبب عدم الدخول','er');return;}r.outcomeReason=reason;}
   r.status=res;r.outcomeAt=Date.now();await saveReqs();updateBell();
   closeM('mOutcome');toast('تم حفظ النتيجة','ok');renderMine();
@@ -1209,8 +1281,8 @@ window.renderAll=function(){
 };
 window.exportCsv=function(){
   const list=visibleRequests();
-  const head=['المرجع','مُقدّم الطلب','الجهة','الجهة المعنية','المنصة','آلية الدخول','نفاذ مالك','الحالة','الغرض من الدخول','المدة المتوقعة','عضو المجلس','المدير','تاريخ الطلب','تاريخ النتيجة','سبب عدم الدخول'];
-  const rows=list.map(r=>[r.ref,r.requesterName,r.company,r.entity||'',r.platform,r.mechanism,r.ownerNafath?'نعم':'لا',ST_AR[r.status],(r.tasks&&r.tasks.length)?r.tasks.map((t,i)=>(i+1)+'. '+t.text).join(' | '):(r.reason||''),r.duration||'',r.boardMember,r.managerName,fmtG(r.createdAt),r.outcomeAt?fmtG(r.outcomeAt):'',r.outcomeReason]);
+  const head=['المرجع','مُقدّم الطلب','الجهة','الجهة المعنية','المنصة','آلية الدخول','نفاذ مالك','الحالة','الغرض من الدخول','المدة المتوقعة','عضو المجلس','قرار المجلس','المدير','تاريخ الطلب','تاريخ النتيجة','سبب عدم الدخول'];
+  const rows=list.map(r=>[r.ref,r.requesterName,r.company,r.entity||'',r.platform,r.mechanism,r.ownerNafath?'نعم':'لا',ST_AR[r.status],(r.tasks&&r.tasks.length)?r.tasks.map((t,i)=>(i+1)+'. '+t.text).join(' | '):(r.reason||''),r.duration||'',r.boardMember,(boardResp[r.id]?(BR_LABEL[boardResp[r.id].decision]||''):''),r.managerName,fmtG(r.createdAt),r.outcomeAt?fmtG(r.outcomeAt):'',r.outcomeReason]);
   const csv='\ufeff'+[head,...rows].map(row=>row.map(c=>'"'+String(c==null?'':c).replace(/"/g,'""')+'"').join(',')).join('\n');
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='سجل-طلبات-الدخول.csv';a.click();
   toast('تم التصدير','ok');
